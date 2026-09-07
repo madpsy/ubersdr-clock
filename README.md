@@ -45,6 +45,43 @@ To install to `/opt/ubersdr-clock/`:
 sudo make install
 ```
 
+## Releasing
+
+The UberSDR container downloads the binaries at image build time rather than compiling them, from the moving `latest` tag:
+
+```
+https://github.com/madpsy/ubersdr-clock/releases/download/latest/ubersdr-clock_${TARGETARCH}
+```
+
+The asset names are constants and the tag never moves, so publishing **replaces** what every container build pulls:
+
+```bash
+./build.sh --publish          # builds both, checks both, then asks before uploading
+./build.sh --publish --yes    # answer that question in advance, for an unattended run
+```
+
+It asks by default and only skips the question for `--yes`. That is a flag rather than an environment variable deliberately — an exported variable is inherited by everything a shell starts, so a `yes` meant for one release would sit there quietly authorising the next.
+
+Two combinations are refused before anything is built:
+
+- **`--publish --no-check`** — that would upload a decoder nothing has watched decode anything. On a receiver a broken build shows up as a clock stuck in `acquiring`, which reads as bad propagation rather than a bad binary, so the check is the only thing catching it.
+- **`--publish --native`** — a host-built binary against a host libstdc++, uploaded to run inside `ubuntu:24.04`.
+
+Only the architectures a given run built are replaced. `./build.sh --arch amd64 --publish` leaves whatever arm64 asset is already on the release exactly as it was, at whatever age it was, and the release page will not say so.
+
+`UBERSDR_CLOCK_REPO` and `UBERSDR_CLOCK_TAG` override the target for a fork or a test release.
+
+Then in `ka9q_ubersdr/docker/Dockerfile`, alongside the other decoder binaries:
+
+```dockerfile
+    && mkdir -p /opt/ubersdr-clock \
+    && wget https://github.com/madpsy/ubersdr-clock/releases/download/latest/ubersdr-clock_${TARGETARCH} \
+         -O /opt/ubersdr-clock/ubersdr-clock_${TARGETARCH} \
+    && chmod +x /opt/ubersdr-clock/ubersdr-clock_${TARGETARCH} \
+```
+
+The arch suffix is kept on the installed name rather than stripped, so the Go wrapper resolves it with `runtime.GOARCH` and several architectures can share the directory — `ubersdr-drm`'s arrangement, and the reason its `resolveBinaryPath()` also falls back to the unsuffixed name for installs predating the change.
+
 ## Tuning
 
 This matters more than anything else here. The decoder is written against a specific audio spectrum, and the filter centres are not negotiable.

@@ -29,6 +29,9 @@
 #   --no-check      build only, skip the decode check
 #   --image IMAGE   build container image (default: ubuntu:24.04)
 #   -j N            parallel jobs (default: all cores)
+#   --publish       upload what this run built to the 'latest' release, which
+#                   is what the UberSDR container downloads at build time
+#   --yes           answer the publish confirmation in advance
 #
 
 set -euo pipefail
@@ -39,7 +42,16 @@ image=ubuntu:24.04
 native=0
 clean=0
 check=1
+publish=0
+assume_yes=0
 jobs=$(nproc 2>/dev/null || echo 4)
+
+# The UberSDR Dockerfile fetches
+#   https://github.com/$REPO/releases/download/$TAG/ubersdr-clock_${TARGETARCH}
+# so the tag is a moving one and the asset names are constants — publishing
+# replaces what that build downloads rather than adding alongside it.
+REPO="${UBERSDR_CLOCK_REPO:-madpsy/ubersdr-clock}"
+TAG="${UBERSDR_CLOCK_TAG:-latest}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -48,6 +60,8 @@ while [ $# -gt 0 ]; do
         --clean)    clean=1; shift ;;
         --no-check) check=0; shift ;;
         --image)    image=$2; shift 2 ;;
+        --publish)  publish=1; shift ;;
+        --yes)      assume_yes=1; shift ;;
         -j)         jobs=$2; shift 2 ;;
         -j*)        jobs=${1#-j}; shift ;;
         -h|--help)  sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^#\{0,1\} \{0,1\}//'; exit 0 ;;
@@ -64,6 +78,90 @@ for a in $arches; do
         *) fail "unknown arch '$a' (expected amd64, arm64, arm or 386)" ;;
     esac
 done
+
+# --- Two refusals, decided before anything is built ----------------------
+#
+# Both are about what a download button is allowed to serve, so they fail here
+# rather than after a long build.
+
+if [ "$publish" = 1 ] && [ "$check" = 0 ]; then
+    fail "--publish and --no-check together would upload a decoder nothing has
+watched decode anything. The check is the only thing standing between a clean
+compile and a binary that locks onto nothing; a receiver would show it as a
+clock that never leaves 'acquiring', which looks like bad propagation rather
+than a bad build. Drop one of the two."
+fi
+
+if [ "$publish" = 1 ] && [ "$native" = 1 ]; then
+    fail "--publish and --native together would upload a binary built against
+this host's libstdc++, and it runs inside ubuntu:24.04. If this host is newer
+it dies at startup on a GLIBCXX_ version error naming everything except the
+real problem. Build it in the container: drop --native."
+fi
+
+# --- Publishing ----------------------------------------------------------
+
+publish_release() { # <binary>...
+    local uploads=("$@")
+
+    command -v gh >/dev/null 2>&1 || {
+        echo "not published: gh not found — install the GitHub CLI, or upload the
+  binaries by hand." >&2
+        return
+    }
+    gh auth status >/dev/null 2>&1 || {
+        echo "not published: gh is not logged in — run 'gh auth login'." >&2
+        return
+    }
+    gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || {
+        echo "not published: there is no '$TAG' release on $REPO to upload to." >&2
+        return
+    }
+
+    echo
+    echo "  Upload to https://github.com/$REPO/releases/tag/$TAG, replacing what is there:"
+    for b in "${uploads[@]}"; do
+        printf '      %-24s %s\n' "$(basename "$b")" "$(du -h "$b" | cut -f1)"
+    done
+    # Only the arches this run built are replaced. Any other arch already on the
+    # release stays exactly as it was, at whatever age it was — so a run with
+    # --arch amd64 leaves an arm64 asset from months ago in place, and the
+    # release will not say so.
+    echo
+
+    # Asked for, one way or the other. The prompt is the default and stays that
+    # way: publishing replaces what the container build downloads, and a run
+    # that reaches this point by accident must not be able to complete it.
+    # `--yes` changes only *when* the answer was given — on the command line
+    # rather than at the prompt, which is the same person saying the same thing
+    # and is what makes an unattended release possible.
+    #
+    # A flag rather than an environment variable on purpose: an exported
+    # variable is inherited by everything a shell starts, so a `yes` meant for
+    # one release would sit there quietly authorising the next.
+    if [ "$assume_yes" = 1 ]; then
+        echo "  --yes given; uploading."
+    elif [ ! -t 0 ]; then
+        echo "not published: --publish asks before uploading and there is no terminal
+  to ask on. Pass --yes to answer it in advance." >&2
+        return
+    else
+        local reply=''
+        read -r -p "  type 'yes' to upload: " reply || true
+        if [ "$reply" != "yes" ]; then
+            echo "  not published."
+            return
+        fi
+    fi
+
+    # --clobber because the asset names are constants: without it the second
+    # release is refused for every name that already exists.
+    if gh release upload "$TAG" "${uploads[@]}" --clobber --repo "$REPO"; then
+        echo "  uploaded to https://github.com/$REPO/releases/tag/$TAG"
+    else
+        echo "not published: the upload failed — the binaries are intact, try again." >&2
+    fi
+}
 
 # --- The work done inside each container ---------------------------------
 #
@@ -153,6 +251,9 @@ if [ "$native" = 1 ]; then
     fi
     say "Done"
     echo "  $built"
+    echo
+    echo "Built with this host's toolchain — fine for testing here, not for the"
+    echo "container. Drop --native for anything you intend to publish."
     exit 0
 fi
 
@@ -196,7 +297,18 @@ say "Done"
 for b in $built; do
     printf '  %s\n' "$(file -b "$b" | cut -d, -f1-2) — $(basename "$b")"
 done
-echo
-echo "Copy to the receiver:"
-echo "  sudo install -d /opt/ubersdr-clock"
-echo "  sudo install -m755 ubersdr-clock_<arch> /opt/ubersdr-clock/"
+
+if [ "$publish" = 1 ]; then
+    say "Publishing"
+    # shellcheck disable=SC2086  # $built is a deliberate whitespace-separated list
+    publish_release $built
+else
+    echo
+    echo "Copy to the receiver:"
+    echo "  sudo install -d /opt/ubersdr-clock"
+    echo "  sudo install -m755 ubersdr-clock_<arch> /opt/ubersdr-clock/"
+    echo
+    echo "Or upload both to the '$TAG' release, which is what the UberSDR"
+    echo "container build downloads:"
+    echo "  ./build.sh --publish"
+fi
