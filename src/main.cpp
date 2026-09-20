@@ -5,8 +5,9 @@
 // binaries (cw-decoder, ubersdr-drm, freedv-ka9q): no framing, no handshake,
 // close stdin to stop.
 //
-// The DSP is AetherSDR's AetherClock chain, copied verbatim — see PROVENANCE
-// in the README. This file is the only part written for UberSDR: it replaces
+// The DSP is AetherSDR's AetherClock chain as corrected by ubersdr-ntp, which
+// is where it is now maintained — see PROVENANCE in the README. This file is
+// the only part written for UberSDR: it replaces
 // the Qt engine (AetherClockEngine) that fed the decoders there, and it does
 // only what that engine did on the receive side — hold the sample<->host
 // anchor, compose a UTC timestamp from the voted frame, and report the offset.
@@ -43,7 +44,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.0.0";
+constexpr const char* kVersion = "1.1.0";
 
 // ---------------------------------------------------------------------------
 // Calendar arithmetic (Howard Hinnant's civil-date algorithms).
@@ -113,13 +114,13 @@ long long hostNowMs() {
 
 // The host clock as the voter's plausibility reference. Fires on this thread
 // inside process(), so it must stay cheap — it is four integer divisions.
-AetherSDR::TimeFields hostNowFields() {
+clockdec::TimeFields hostNowFields() {
     const long long secs = floorDiv(hostNowMs(), 1000);
     const long long days = floorDiv(secs, 86400);
     const long long rem = floorMod(secs, 86400);
     int y = 0; unsigned mo = 0, d = 0;
     civilFromDays(days, y, mo, d);
-    AetherSDR::TimeFields tf;
+    clockdec::TimeFields tf;
     tf.minute = static_cast<int>((rem / 60) % 60);
     tf.hour = static_cast<int>(rem / 3600);
     tf.doy = static_cast<int>(days - daysFromCivil(y, 1, 1)) + 1;
@@ -220,8 +221,8 @@ private:
 
 // ---------------------------------------------------------------------------
 
-const char* stationName(AetherSDR::ClockStation s) {
-    using AetherSDR::ClockStation;
+const char* stationName(clockdec::ClockStation s) {
+    using clockdec::ClockStation;
     switch (s) {
         case ClockStation::Wwv:  return "wwv";
         case ClockStation::Wwvh: return "wwvh";
@@ -230,8 +231,8 @@ const char* stationName(AetherSDR::ClockStation s) {
     }
 }
 
-const char* stateName(AetherSDR::ClockLockState s) {
-    using AetherSDR::ClockLockState;
+const char* stateName(clockdec::ClockLockState s) {
+    using clockdec::ClockLockState;
     switch (s) {
         case ClockLockState::Locked:    return "locked";
         case ClockLockState::Acquiring: return "acquiring";
@@ -240,7 +241,7 @@ const char* stateName(AetherSDR::ClockLockState s) {
 }
 
 const char* refusalName(std::uint8_t r) {
-    using AetherSDR::ClockLockRefusal;
+    using clockdec::ClockLockRefusal;
     switch (static_cast<ClockLockRefusal>(r)) {
         case ClockLockRefusal::QualityFloor: return "quality_floor";
         case ClockLockRefusal::Plausibility: return "plausibility";
@@ -250,8 +251,31 @@ const char* refusalName(std::uint8_t r) {
     }
 }
 
+// Where the WWV/WWVH decoder puts a second edge relative to the true edge in
+// its input: 13.6 ms EARLY. The matched filter's chain group delay is taken as
+// kNominalDelaySamples = 7 series samples where it measures 4.27, and one
+// series sample at 200 Hz is 5 ms, so the label lands (7 - 4.27) * 5 ms early.
+//
+// Measured, not estimated: tools/decodertest synthesises WWV and WWVH and
+// reports this mean over every edge it checks -- -13.642 and -13.635 ms, spread
+// about +/-1 ms. The WWVB decoder's edges are exact to 0.02 ms, so it has no
+// such term.
+//
+// Corrected here rather than in the decoder. kNominalDelaySamples was
+// calibrated upstream against real off-air audio through a real receive chain,
+// and the delay tracker and its search rails are built around that value;
+// moving it to suit a synthetic generator would be fitting the decoder to the
+// test. The bias it leaves is a known constant, so it is taken off the offset
+// instead. ubersdr-ntp carries the identical term for the identical reason.
+constexpr double kWwvDecoderEdgeBiasMs = -13.645;
+
 struct Options {
     int sampleRate = 12000;
+    // One-way delay this process cannot see, in milliseconds, added back to
+    // offset_ms. See --extra-delay-ms in usage() and the delay section of the
+    // README: for a receiver this is dominated by the ionospheric path from
+    // the transmitter, which nothing here can compute.
+    double extraDelayMs = 0.0;
     bool wwvb = false;
     bool seconds = true;
     bool envelope = false;
@@ -272,13 +296,13 @@ public:
         return static_cast<double>(m_anchorMs) + 1000.0 * static_cast<double>(n) / m_rate;
     }
 
-    void onState(AetherSDR::ClockLockState s, AetherSDR::ClockStation st) {
+    void onState(clockdec::ClockLockState s, clockdec::ClockStation st) {
         Json j;
         j.str("type", "state").str("state", stateName(s)).str("station", stationName(st));
         j.emit();
     }
 
-    void onSecond(const AetherSDR::ClockSecondInfo& i, AetherSDR::ClockStation st) {
+    void onSecond(const clockdec::ClockSecondInfo& i, clockdec::ClockStation st) {
         if (!m_o.seconds) return;
         Json j;
         j.str("type", "second")
@@ -288,6 +312,14 @@ public:
          .i("second_of_frame", i.secondOfFrame)
          .i("series_rate", i.seriesRateHz)
          .i("window_shift", i.windowShift)
+         // Whether THIS second carried its own timing evidence. False for
+         // WWV/WWVH's minute hole (second 0 has no subcarrier pulse to align
+         // to), for sub-threshold seconds, and for WWVB seconds whose carrier
+         // drop was not found. The edge is still the decoder's tracked cadence
+         // and is correct to its usual accuracy, but nothing in this second
+         // measured it -- so a caller computing an offset from edge_sample
+         // should prefer the seconds where this is true.
+         .b("edge_measured", i.edgeMeasured)
          .str("station", stationName(st));
         if (m_o.envelope) {
             j.arr("envelope", i.envelope, 3);
@@ -296,7 +328,7 @@ public:
         j.emit();
     }
 
-    void onFrame(const AetherSDR::ClockFrameInfo& f) {
+    void onFrame(const clockdec::ClockFrameInfo& f) {
         // Recorded whether or not the frame is emitted: onTime composes
         // against it, and a raw frame decode is never suppressed anyway.
         m_frameStartSample = f.frameStartSample;
@@ -314,7 +346,7 @@ public:
         j.emit();
     }
 
-    void onTime(const AetherSDR::ClockTimeInfo& t) {
+    void onTime(const clockdec::ClockTimeInfo& t) {
         // onFrame always precedes a vote, but a decoder that locked on a
         // backlog replay could in principle reach here first; composing
         // against a frame start of 0 would put the timestamp minutes out.
@@ -330,7 +362,24 @@ public:
             static_cast<double>(t.lastEdgeSample - m_frameStartSample) / m_rate);
         const long long decodedMs = baseMs + elapsedSec * 1000LL;
 
-        const double offsetMs = static_cast<double>(decodedMs) - hostMsAtSample(t.lastEdgeSample);
+        // The raw difference is the decoded time against the host clock at the
+        // sample the edge was OBSERVED at, so it still contains every delay
+        // between the transmitter and here. Two of those are known:
+        //
+        //   the decoder's own edge bias, which is this binary's business and is
+        //   taken off unconditionally (WWV/WWVH only -- see the constant);
+        //
+        //   whatever the caller has measured or modelled and passed in, which
+        //   for a receiver is mostly the ionospheric path. Added back, because
+        //   the observation instant is late by it.
+        //
+        // What remains uncorrected is everything between the antenna and this
+        // process's stdin: receiver buffering, the codec, the transport. A
+        // caller that knows those should fold them into --extra-delay-ms.
+        const double edgeBias = m_o.wwvb ? 0.0 : kWwvDecoderEdgeBiasMs;
+        const double offsetMs = static_cast<double>(decodedMs)
+                                - hostMsAtSample(t.lastEdgeSample)
+                                + edgeBias + m_o.extraDelayMs;
 
         Json j;
         j.str("type", "time")
@@ -339,6 +388,14 @@ public:
          .i("minute", t.minute).i("hour", t.hour).i("doy", t.doy).i("year2", t.year2)
          .i("quality", std::clamp(static_cast<int>(std::lround(t.quality * 100.0)), 0, 100))
          .f("offset_ms", offsetMs, 1)
+         // The total correction already folded into offset_ms above: the
+         // decoder's edge bias plus --extra-delay-ms. A caller that recomputes
+         // the offset from last_edge_sample against a better host clock -- as
+         // UberSDR's audio extension does -- is replacing the raw difference
+         // only, and must add this back or it throws the corrections away with
+         // the anchor. Emitted rather than left for the caller to hardcode, so
+         // there is one place the figure lives.
+         .f("delay_applied_ms", edgeBias + m_o.extraDelayMs, 3)
          .i("last_edge_sample", t.lastEdgeSample)
          .i("frame_start_sample", m_frameStartSample)
          .i("host_anchor_ms", m_anchorMs)
@@ -346,8 +403,8 @@ public:
         j.emit();
     }
 
-    void onDiag(const AetherSDR::ClockDecoderDiagnostics& g,
-                AetherSDR::ClockLockState s, AetherSDR::ClockStation st,
+    void onDiag(const clockdec::ClockDecoderDiagnostics& g,
+                clockdec::ClockLockState s, clockdec::ClockStation st,
                 std::int64_t samples) {
         Json j;
         j.str("type", "diag")
@@ -357,6 +414,11 @@ public:
          .b("tone_detected", g.toneDetected)
          .b("phase_locked", g.phaseLocked)
          .f("delay_est_ms", g.delayEstMs, 2)
+         // What the WWV/WWVH station tag is decided from: the folded tick
+         // excess of the 2000 Hz band over the 2200 Hz band. Above +1.8 dB
+         // leans WWV and below -1.8 dB leans WWVH; a lone WWV reads about
+         // +5 dB. Null for WWVB and before the fold locks.
+         .f("tick_band_ratio_db", g.tickBandRatioDb, 2)
          .b("anchored", g.anchored)
          .i("bad_frame_streak", g.badFrameStreak)
          .i("frames_in_window", g.framesInWindow)
@@ -389,10 +451,10 @@ int run(const Options& o) {
     Decoder decoder(o.sampleRate);
     Emitter em(o, o.sampleRate);
 
-    decoder.onStateChanged = [&](AetherSDR::ClockLockState s) { em.onState(s, decoder.station()); };
-    decoder.onSecond = [&](const AetherSDR::ClockSecondInfo& i) { em.onSecond(i, decoder.station()); };
-    decoder.onFrame = [&](const AetherSDR::ClockFrameInfo& f) { em.onFrame(f); };
-    decoder.onTime = [&](const AetherSDR::ClockTimeInfo& t) { em.onTime(t); };
+    decoder.onStateChanged = [&](clockdec::ClockLockState s) { em.onState(s, decoder.station()); };
+    decoder.onSecond = [&](const clockdec::ClockSecondInfo& i) { em.onSecond(i, decoder.station()); };
+    decoder.onFrame = [&](const clockdec::ClockFrameInfo& f) { em.onFrame(f); };
+    decoder.onTime = [&](const clockdec::ClockTimeInfo& t) { em.onTime(t); };
 
     if (o.plausibilityMinutes > 0)
         decoder.setPlausibility(hostNowFields, o.plausibilityMinutes);
@@ -470,6 +532,11 @@ void usage() {
         "  --diag-seconds N           Diagnostics event every N seconds, 0 = off (default: 10)\n"
         "  --plausibility-minutes N   Refuse a lock more than N minutes from the host\n"
         "                             clock, 0 = disarm (default: 1440)\n"
+        "  --extra-delay-ms MS        One-way delay this process cannot see, added back\n"
+        "                             to offset_ms (default: 0). For a receiver this is\n"
+        "                             mostly the ionospheric path from the transmitter,\n"
+        "                             which nothing here can compute -- see the README.\n"
+        "                             The decoder's own edge bias is already corrected.\n"
         "  --version                  Print the version and exit\n"
         "  --help                     Print this and exit\n"
         "\n"
@@ -480,6 +547,27 @@ void usage() {
         "  from its 2000 Hz (WWV) / 2200 Hz (WWVH) image, and without it the\n"
         "  decoder never gets a second edge to classify against.\n",
         kVersion);
+}
+
+// Parses a signed millisecond argument. Separate from parseInt: this one is
+// fractional and may be negative -- a caller that has measured its chain can
+// legitimately hand back a correction in either direction.
+bool parseMs(const char* opt, const char* text, double& out) {
+    if (text == nullptr) {
+        std::fprintf(stderr, "ubersdr-clock: %s requires a value\n", opt);
+        return false;
+    }
+    char* end = nullptr;
+    const double v = std::strtod(text, &end);
+    // A whole second of unseen one-way delay is not a path, it is a mistake --
+    // and silently accepting one would move the served second.
+    if (end == text || *end != '\0' || !std::isfinite(v) || v < -1000.0 || v > 1000.0) {
+        std::fprintf(stderr, "ubersdr-clock: %s: not a valid millisecond value "
+                             "in -1000..1000: %s\n", opt, text);
+        return false;
+    }
+    out = v;
+    return true;
 }
 
 // Parses an integer argument, or reports which option was wrong and why.
@@ -542,6 +630,9 @@ int main(int argc, char** argv) {
         } else if (a == "--plausibility-minutes") {
             if (!parseInt("--plausibility-minutes", next, o.plausibilityMinutes)) return 2;
             ++i;
+        } else if (a == "--extra-delay-ms") {
+            if (!parseMs("--extra-delay-ms", next, o.extraDelayMs)) return 2;
+            ++i;
         } else {
             std::fprintf(stderr, "ubersdr-clock: unknown option: %s "
                                  "(try --help)\n", argv[i]);
@@ -567,5 +658,5 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    return o.wwvb ? run<AetherSDR::WwvbDecoder>(o) : run<AetherSDR::WwvDecoder>(o);
+    return o.wwvb ? run<clockdec::WwvbDecoder>(o) : run<clockdec::WwvDecoder>(o);
 }

@@ -16,6 +16,34 @@ add_executable(ubersdr-clock
 
 target_include_directories(ubersdr-clock PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# ---------------------------------------------------------------------------
+# Offline decoder accuracy test.
+#
+# Synthesises WWV/WWVH/WWVB at several sample rates, sub-sample phases and
+# noise levels -- including leap-second minutes and both station tags -- and
+# checks the decoded timestamps and the edge error against the truth it
+# generated. Needs no receiver, no network and no recording, so it can be run
+# on any change to the decoders.
+#
+# This is the evidence behind the timing constants. kNominalDelaySamples and
+# the voter's calibration figures were measured against real off-air audio
+# through a real receive chain, which this cannot reproduce -- it reports the
+# synthetic-exact value alongside so the difference stays visible -- so treat a
+# change to them as needing off-air evidence, not a passing run here.
+#
+# Not installed: it is a development tool.
+# ---------------------------------------------------------------------------
+add_executable(ubersdr-clock-decodertest
+    tools/decodertest.cpp
+    src/WwvDecoder.cpp
+    src/WwvbDecoder.cpp
+    src/TimeFrameVoter.cpp
+)
+target_include_directories(ubersdr-clock-decodertest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(ubersdr-clock-decodertest PRIVATE -Wall -Wextra)
+find_package(Threads REQUIRED)
+target_link_libraries(ubersdr-clock-decodertest PRIVATE Threads::Threads)
+
 if(MSVC)
     target_compile_options(ubersdr-clock PRIVATE /W4)
 else()

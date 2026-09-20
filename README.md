@@ -4,7 +4,7 @@ Standalone WWV / WWVH / WWVB time-code decoder. Reads raw PCM audio from stdin, 
 
 Built for UberSDR as an external decoder binary, in the same shape as `cw-decoder`, `ubersdr-drm` and `freedv-ka9q`: the Go audio extension spawns it, pipes the session's demodulated audio into stdin, and reads events from stdout. It runs fine on its own from a WAV file too.
 
-The DSP is AetherSDR's AetherClock chain, taken unmodified — see [Provenance](#provenance).
+The DSP is AetherSDR's AetherClock chain, as corrected by [ubersdr-ntp](https://github.com/madpsy/ubersdr-ntp) — see [Provenance](#provenance).
 
 ## Dependencies
 
@@ -144,14 +144,38 @@ Emitted while locked, once per decoded frame for WWV/WWVH and once per second fo
 |---|---|
 | `utc` / `utc_ms` | The decoded broadcast time, composed from the voted frame's second 0 plus the elapsed samples to the last second edge |
 | `quality` | Voter lock confidence, 0–100. The **minimum** winning margin across the voted bits, not the mean — a timestamp is only as trustworthy as its least-certain bit |
-| `offset_ms` | Decoded time minus host clock at the same instant. Positive = the host clock is slow. **See the warning below** |
+| `offset_ms` | Decoded time minus host clock at the same instant, corrected for the decoder's own edge bias and for `--extra-delay-ms`. Positive = the host clock is slow. **See the warnings below** |
 | `last_edge_sample` | Input sample index of the second edge the timestamp is anchored to |
 | `frame_start_sample` | Input sample index of second 0 of the voted frame |
 | `host_anchor_ms` | Wall clock when the first sample was read |
 
 **`offset_ms` is only meaningful on a real-time stream.** A pipe carries samples, not timestamps, so the host anchor is the wall clock at the first sample advanced by the sample count. Replay a file and the number is nonsense — the file arrives at disk speed. Even on a live stream it inherits every buffer between the receiver and this process.
 
-The sample indices are there so the caller can do better. UberSDR's audio extensions receive a GPS-synchronised `GPSTimeNs` on every `AudioSample`; a wrapper that tracks how many samples it has written can map `last_edge_sample` onto a real timestamp and recompute the offset properly, ignoring `offset_ms` entirely.
+The sample indices are there so the caller can do better. UberSDR's audio extensions receive a per-packet arrival timestamp on every `AudioSample`, so its wrapper tracks how many samples it has written, maps `last_edge_sample` onto that, and replaces `offset_ms` — re-anchoring continuously instead of once, which removes the pipe latency and the drift. It marks the result `"offset_source": "packet"`.
+
+That timestamp is **not** a hardware or GPS one, despite what the field is called in UberSDR's source: it is `time.Now()` when the RTP packet arrives from radiod. So a fixed bias remains — radiod's own buffering plus the multicast hop, some tens of milliseconds — and it is a bias rather than a drift. Good enough to say a clock is seconds out; not good enough to discipline anything with.
+
+#### What is in `offset_ms`, and what is not
+
+The raw difference is the decoded time against the host clock at the sample the edge was *observed* at, so it contains every delay between the transmitter and this process's stdin. One of those is this binary's own business and is corrected here; the rest are the caller's.
+
+| Term | Typical | Corrected here? |
+|---|---|---|
+| **Decoder edge bias** | −13.6 ms (WWV/WWVH), 0 (WWVB) | **Yes**, unconditionally — see below |
+| **Ionospheric path** from the transmitter | +5 to +40 ms | **No.** Nothing here knows where it or the transmitter is |
+| Receiver buffering, multicast hop | tens of ms | No — the caller's; not visible from stdin |
+| Codec (Opus) | ~8 ms | No — the caller's |
+| Anything else the caller has measured | — | No |
+
+Everything in the "no" rows can be handed back with **`--extra-delay-ms`**, which is added to `offset_ms`. A caller that models the path properly should compute it and pass it; a caller that does not should read `offset_ms` as carrying a positive bias of a few tens of milliseconds.
+
+**The ionospheric term is the one most easily forgotten, and it is not small.** A signal from Fort Collins is delayed by roughly 5 ms at 1000 km and 25 ms at 7000 km, by however many hops the geometry demands. Uncorrected, all of it is attributed to *your* clock being slow. [ubersdr-ntp](https://github.com/madpsy/ubersdr-ntp) models this — great-circle distance, a specular reflection at a 350 km virtual height, hop count from the minimum usable elevation angle — because it has the receiver's coordinates to do it with. This binary reads a pipe and has neither coordinate nor frequency, so it cannot, and says so rather than quietly pretending the delay is zero.
+
+#### The decoder edge bias
+
+The WWV/WWVH decoder reports each second edge **13.645 ms early**. Its matched filter takes the biquad chain's group delay as 7 series samples where it measures 4.27, and one series sample at 200 Hz is 5 ms, so the label lands (7 − 4.27) × 5 ms early. That figure is measured, not assumed: `ubersdr-clock-decodertest` reports the mean over every edge it checks, −13.642 ms for WWV and −13.635 ms for WWVH, spread about ±1 ms. The WWVB decoder's edges are exact to 0.02 ms and get no such term.
+
+It is corrected in `main.cpp` rather than fixed in the decoder. `kNominalDelaySamples` was calibrated against real off-air audio through a real receive chain, and the delay tracker and its search rails are built around that value — moving it to suit a synthetic generator would be fitting the decoder to the test. ubersdr-ntp carries the identical constant for the identical reason.
 
 ### `frame` — one raw frame decode, before voting
 
@@ -259,6 +283,26 @@ The default bound of one day is deliberately generous: a host clock that is hour
 
 It defaults to starting at the next whole minute so the plausibility gate is satisfied; pass `--start YYYY-MM-DDTHH:MM` for a fixed time (and then `--plausibility-minutes 0`, or the gate will correctly refuse it).
 
+### The offline decoder test
+
+`ubersdr-clock-decodertest`, built alongside the daemon, is the same generator driven in anger: WWV, WWVH and WWVB at several sample rates, sub-sample phases and noise levels, including leap-second minutes (announced, warned-but-absent, and unannounced) and every station-tag case. It checks the decoded timestamps and the edge error against the truth it generated, and finishes with the measured edge bias per station — which is where the −13.645 ms constant above comes from.
+
+```bash
+cmake -S . -B build && cmake --build build
+./build/ubersdr-clock-decodertest
+```
+
+```
+station edge bias over all runs (measured edges after lock):
+  WWV  n=14601  mean -13.642 ms  min -14.62  max -12.67
+  WWVH n=9006   mean -13.635 ms  min -14.50  max -12.85
+  WWVB n=18208  mean  +0.018 ms  min  -1.04  max  +0.90
+
+93 scenarios, 0 failed
+```
+
+It needs no receiver, no network and no recording, so run it on any change to the decoders. It cannot reproduce a real receive chain, so it reports the synthetic-exact value of `kNominalDelaySamples` alongside rather than asserting on it: **a change to that constant needs off-air evidence, not a passing run here.**
+
 This is a signal generator, not a channel model. It proves the decode chain end to end and catches regressions; it says nothing about how the decoder behaves on a real fading HF path.
 
 ### What the synthetic signal does not validate
@@ -271,9 +315,16 @@ But it means the ~20 ms sits in `offset_ms` as an unvalidated systematic term un
 
 ## Provenance
 
-`src/WwvDecoder.*`, `src/WwvbDecoder.*` and `src/TimeFrameVoter.*` are copied **unmodified** from [AetherSDR](https://github.com/aethersdr/AetherSDR) (`src/core/`, commit `b9f44f3`), where they are the DSP half of its AetherClock feature. They are already Qt-free and dependency-free by design, so they compile here as they are.
+`src/WwvDecoder.*`, `src/WwvbDecoder.*`, `src/TimeFrameVoter.*` and `src/CivilTime.h` are the decoders as they stand in [ubersdr-ntp](https://github.com/madpsy/ubersdr-ntp) (`src/clock/`), which is where they are now maintained — it runs them continuously against several receivers and several frequencies at once, and serves the result as NTP, so timing errors there are visible in a way they are not here.
 
-They are kept byte-identical on purpose: it makes upstream fixes a straight `cp`, and the voter in particular carries calibration constants tuned against live WWV corpora that should not drift without upstream's evidence behind the change. Anything UberSDR-specific belongs in `src/main.cpp`.
+They began as a verbatim copy of AetherSDR's AetherClock DSP (`src/core/`, commit `b9f44f3`), and were byte-identical for as long as that held. It no longer does. ubersdr-ntp's measurements found and fixed, in these files:
+
+- **Sub-sample edge timing.** WWV's reported edge followed the raw per-second matched-filter shift, which is 5 ms-quantised and moves ±15 ms under noise; it now follows a smoothed sub-sample estimate of the same shift. WWVB's edge had a dead zone and no correction for its own low-pass group delay, which is now computed from the filter coefficients and subtracted analytically.
+- **The WWV/WWVH station tag**, now taken from tick energy above background. The old test mislabelled a WWV receiver as WWVH — which matters, because the two transmitters are 5500 km apart.
+- **Leap-second minutes** no longer emit wrong timestamps, and **WWVB's DST bits** were the wrong way round (s57 and s58 swapped).
+- **The station tag survives a restart** and a borderline signal, rather than being re-derived from Unknown each time.
+
+So an upstream fix is no longer a straight `cp` in either direction — diff first. The voter's calibration constants and `WwvDecoder`'s `kNominalDelaySamples` are still AetherSDR's and should not drift without off-air evidence; `tools/decodertest.cpp` is that evidence offline, and the measured consequence of `kNominalDelaySamples` is corrected in `main.cpp` rather than by moving it. Anything UberSDR-specific belongs in `src/main.cpp`.
 
 `src/main.cpp` is written for this repo. It replaces AetherSDR's `AetherClockEngine` (which is Qt, and also owns FlexRadio DAX channel lifecycle) with a stdio front end, keeping only what the engine did on the receive path: hold the sample↔host anchor, arm the voter's plausibility gate against the host clock, and compose the UTC timestamp from the voted frame's second 0 plus elapsed samples.
 

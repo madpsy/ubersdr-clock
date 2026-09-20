@@ -1,7 +1,7 @@
 #pragma once
 
 // WWV/WWVH 100 Hz-subcarrier BCD time-code decoder — streaming port of the
-// gate-passed AetherClock reference chain (research/wwv_decode_proto.py).
+// gate-passed reference chain (research/wwv_decode_proto.py).
 // Format facts per the NIST WWV/WWVH time-code table (NIST SP 432).
 //
 // Input contract: 24 kHz mono float32 from a slice tuned USB at
@@ -27,7 +27,7 @@
 #include <functional>
 #include <memory>
 
-namespace AetherSDR {
+namespace clockdec {
 
 class WwvDecoder {
 public:
@@ -50,6 +50,16 @@ public:
     void setPlausibility(std::function<TimeFields()> referenceNow,
                          int boundMinutes);
 
+    // Start from a station tag already established -- the one this source's
+    // previous decoder held -- rather than Unknown. The tag is still judged
+    // every second and switched or released on the usual evidence; this only
+    // spares a restarted decoder the half-minute it takes to re-derive what was
+    // already known. Ignored once pinned, and for anything but Wwv or Wwvh.
+    void presetStation(ClockStation s);
+    // Fix the tag for good, for a carrier only one station transmits on (WWV
+    // alone uses 20 and 25 MHz). Never judged afterwards; survives reset().
+    void pinStation(ClockStation s);
+
     ClockLockState state() const;
     ClockStation station() const;      // Wwv or Wwvh once tick-tagged
     std::int64_t samplesConsumed() const;
@@ -70,4 +80,4 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
-} // namespace AetherSDR
+} // namespace clockdec
