@@ -11,6 +11,7 @@ add_executable(ubersdr-clock
     src/main.cpp
     src/WwvDecoder.cpp
     src/WwvbDecoder.cpp
+    src/Dcf77Decoder.cpp
     src/TimeFrameVoter.cpp
 )
 
@@ -43,6 +44,21 @@ target_include_directories(ubersdr-clock-decodertest PRIVATE ${CMAKE_CURRENT_SOU
 target_compile_options(ubersdr-clock-decodertest PRIVATE -Wall -Wextra)
 find_package(Threads REQUIRED)
 target_link_libraries(ubersdr-clock-decodertest PRIVATE Threads::Threads)
+
+# The DCF77 decoder's own test: AM and PM synthesised per PTB across noise,
+# carrier offset, interference, fades, a CET->CEST change and a leap second,
+# then five minutes of real DCF77 IQ (tools/testdata/dcf77_live.wav) decoded
+# and checked against the time its recording shows. A path on the command line
+# replaces the recording.
+add_executable(ubersdr-clock-dcf77test
+    tools/dcf77test.cpp
+    src/Dcf77Decoder.cpp
+    src/TimeFrameVoter.cpp
+)
+target_include_directories(ubersdr-clock-dcf77test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(ubersdr-clock-dcf77test PRIVATE -Wall -Wextra)
+target_compile_definitions(ubersdr-clock-dcf77test PRIVATE
+    DCF77_TESTDATA="${CMAKE_CURRENT_SOURCE_DIR}/tools/testdata/dcf77_live.wav")
 
 if(MSVC)
     target_compile_options(ubersdr-clock PRIVATE /W4)

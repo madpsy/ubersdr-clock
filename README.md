@@ -1,8 +1,8 @@
 # ubersdr-clock
 
-Standalone WWV / WWVH / WWVB time-code decoder. Reads raw PCM audio from stdin, writes decoded time as JSON to stdout. No dependencies beyond a C++20 compiler — no Qt, no FFTW, no system libraries beyond libstdc++.
+Standalone WWV / WWVH / WWVB / DCF77 time-code decoder. Reads raw PCM (audio, or I/Q for DCF77) from stdin, writes decoded time as JSON to stdout. No dependencies beyond a C++20 compiler — no Qt, no FFTW, no system libraries beyond libstdc++.
 
-Built for UberSDR as an external decoder binary, in the same shape as `cw-decoder`, `ubersdr-drm` and `freedv-ka9q`: the Go audio extension spawns it, pipes the session's demodulated audio into stdin, and reads events from stdout. It runs fine on its own from a WAV file too.
+Built for UberSDR as an external decoder binary, in the same shape as `cw-decoder`, `ubersdr-drm` and `freedv-ka9q`: the Go audio extension spawns it, pipes the session's demodulated audio (or, for DCF77, its IQ) into stdin, and reads events from stdout. It runs fine on its own from a WAV file too.
 
 The DSP is AetherSDR's AetherClock chain, as corrected by [ubersdr-ntp](https://github.com/madpsy/ubersdr-ntp) — see [Provenance](#provenance).
 
@@ -90,14 +90,15 @@ This matters more than anything else here. The decoder is written against a spec
 |---|---|---|
 | **WWV / WWVH** | **USB at (carrier − 1 kHz)** — 4.999, 9.999, 14.999, 19.999 MHz | Puts the RF carrier at 1000 Hz audio, the 100 Hz BCD subcarrier sidebands at 900/1100 Hz, and the seconds tick at its 2000 Hz (WWV) / 2200 Hz (WWVH) image |
 | **WWVB** | **USB at 0.059 MHz** | Puts the 60 kHz carrier at ~1000 Hz audio, where the PWM rides on its amplitude |
+| **DCF77** | **IQ at 0.0775 MHz** | Puts the 77.5 kHz carrier at 0 Hz of the complex baseband. The decoder reads the 512-chip phase code as well as the amplitude cuts, and USB audio carries no phase. A dial off the carrier works if `--carrier-offset-hz` says where it is |
 
 **The passband must reach 2.2 kHz.** The WWV/WWVH second edge is recovered entirely from the tick image, and the station tag (WWV vs WWVH) is decided by which of the 2000/2200 Hz bands folds to an impulse. A 2.4 kHz SSB filter clips one or both, and the decoder never gets a second edge to classify against — it will sit in `acquiring` forever with `tone_detected: false`. WWVB only needs its ~1 kHz tone.
 
 ## Input
 
-**Mono signed 16-bit little-endian raw PCM on stdin** at the rate given by `--sample-rate` (default: 12000 Hz).
+**Signed 16-bit little-endian raw PCM on stdin** at the rate given by `--sample-rate` (default: 12000 Hz): mono for WWV/WWVH/WWVB, **interleaved I then Q** for DCF77.
 
-No WAV header — raw samples only. 12 kHz is UberSDR's rate for `usb`/`lsb`/`cwu`/`cwl`; AM/FM sessions are 24 kHz.
+No WAV header — raw samples only. 12 kHz is UberSDR's rate for `usb`/`lsb`/`cwu`/`cwl` and for `iq`; AM/FM sessions are 24 kHz. Sample indices in the output (`edge_sample` and the rest) count frames, so an I/Q pair is one sample.
 
 ```bash
 # From a WAV file
@@ -108,9 +109,13 @@ rtl_fm -f 9.999M -M usb -s 12000 - | ./ubersdr-clock_amd64
 
 # Synthetic signal, for a smoke test with no receiver
 ./tools/wwvgen.py --minutes 6 | ./ubersdr-clock_amd64
+
+# The bundled DCF77 recording (stereo I/Q WAV): strip the 44-byte header
+tail -c +45 tools/testdata/dcf77_live.wav | \
+    ./ubersdr-clock_amd64 --station dcf77 --plausibility-minutes 0
 ```
 
-The sample rate must be a multiple of the decoder's internal series rate — 200 Hz for WWV/WWVH, 100 Hz for WWVB — or decimation drifts. 12000 and 24000 both divide cleanly; anything that does not is refused at startup rather than decoded wrongly.
+The sample rate must be a multiple of the decoder's internal series rate — 200 Hz for WWV/WWVH, 100 Hz for WWVB and DCF77 — or decimation drifts. 12000 and 24000 both divide cleanly; anything that does not is refused at startup rather than decoded wrongly.
 
 ## Output
 
@@ -125,7 +130,7 @@ One JSON object per line on stdout, flushed per line. Five event types.
 | Field | Values |
 |---|---|
 | `state` | `nosignal`, `acquiring`, `locked` |
-| `station` | `unknown`, `wwv`, `wwvh`, `wwvb` |
+| `station` | `unknown`, `wwv`, `wwvh`, `wwvb`, `dcf77` |
 
 `station` stays `unknown` until the tick fold separates the two bands confidently; it is never guessed.
 
@@ -239,7 +244,8 @@ Argument errors go to stderr with exit code 2 instead — nothing is decoding ye
 | Option | Description |
 |---|---|
 | `--sample-rate HZ` | Input PCM rate (default: 12000) |
-| `--station NAME` | `wwv`, `wwvh` or `wwvb` (default: `wwv`) |
+| `--station NAME` | `wwv`, `wwvh`, `wwvb` or `dcf77` (default: `wwv`) |
+| `--carrier-offset-hz HZ` | DCF77 only: the carrier's place in the baseband, 77500 minus the dial (default: 0) |
 | `--no-seconds` | Suppress the per-second events |
 | `--envelope` | Include the 1 s alignment arrays in second events |
 | `--diag-seconds N` | Diagnostics interval, 0 to disable (default: 10) |
@@ -251,7 +257,8 @@ Argument errors go to stderr with exit code 2 instead — nothing is decoding ye
 Two of these are not optional for an embedding caller:
 
 - **`--sample-rate` always.** The default of 12000 matches UberSDR's `usb`/`lsb`/`cwu`/`cwl` sessions, but an AM or FM session is 24000. Passing the wrong one does not fail — it decodes at the wrong speed and never locks.
-- **`--station wwvb` when tuned to WWVB.** WWV/WWVH and WWVB are genuinely different decoders: a 100 Hz BCD subcarrier against PWM on the carrier's own amplitude, LSB-first weights against MSB-first, a marker-hole anchoring search against a double marker. Nothing can be shared, and neither will decode the other's signal. A caller that knows the dial frequency can decide this without asking anyone — below 1 MHz is WWVB, everything else is WWV/WWVH.
+- **`--station wwvb` when tuned to WWVB.** WWV/WWVH and WWVB are genuinely different decoders: a 100 Hz BCD subcarrier against PWM on the carrier's own amplitude, LSB-first weights against MSB-first, a marker-hole anchoring search against a double marker. Nothing can be shared, and neither will decode the other's signal. A caller that knows the dial frequency can decide this without asking anyone — within a few kHz of 77.5 kHz is DCF77, otherwise below 1 MHz is WWVB, everything else is WWV/WWVH.
+- **`--station dcf77`, with I/Q input, when tuned to DCF77.** A third decoder again: the carrier cut (AM) and a pseudo-random phase code (PM), both every second, each minute decoded from both and certified only when they do not contradict each other. It reads I/Q rather than audio, so the caller has to deliver an IQ stream, not just pass the flag.
 
 Everything else is automatic. In particular **`wwv` and `wwvh` select the same decoder**: it identifies the station itself from which tick band folds to an impulse, and reports it in `station` on every event. Frame sync, symbol timing, sample-clock drift tracking and resynchronisation after a discontinuity need no help either.
 
@@ -264,6 +271,17 @@ This is a safety gate, and turning it off is riskier than it looks. A deep fade 
 The default bound of one day is deliberately generous: a host clock that is hours wrong is exactly what this tool measures, and only a decode *decades* out can be assumed garbage. Disarm it (`0`) for offline corpus work where there is no meaningful reference, not on a live receiver.
 
 ## Testing without a receiver
+
+### DCF77
+
+`ubersdr-clock-dcf77test` synthesises DCF77 as an UberSDR `iq` session delivers it — AM, the phase code, noise, carrier offset, a strong interferer 10 Hz off, fades, a CET→CEST change and an announced leap second — and checks every label and edge against the truth. It then decodes `tools/testdata/dcf77_live.wav`, five minutes of real DCF77 I/Q from a KiwiSDR 35 km from Mainflingen, and checks it reads 2026-05-24T09:20Z, which is the time the recording itself shows.
+
+```bash
+cmake -S . -B build && cmake --build build
+./build/ubersdr-clock-dcf77test
+```
+
+### WWV, WWVH and WWVB
 
 `tools/wwvgen.py` synthesises the audio a correctly-tuned receiver would hear — the 1000 Hz carrier, the 100 Hz BCD subcarrier with the NIST pulse lengths, the second 0 subcarrier hole, and the tick at its audio image. `--wwvb` generates the PWM-on-amplitude form instead. It needs only the Python standard library.
 
@@ -315,9 +333,11 @@ But it means the ~20 ms sits in `offset_ms` as an unvalidated systematic term un
 
 ## Provenance
 
-`src/WwvDecoder.*`, `src/WwvbDecoder.*`, `src/TimeFrameVoter.*` and `src/CivilTime.h` are the decoders as they stand in [ubersdr-ntp](https://github.com/madpsy/ubersdr-ntp) (`src/clock/`), which is where they are now maintained — it runs them continuously against several receivers and several frequencies at once, and serves the result as NTP, so timing errors there are visible in a way they are not here.
+`src/WwvDecoder.*`, `src/WwvbDecoder.*`, `src/Dcf77Decoder.*`, `src/TimeFrameVoter.*` and `src/CivilTime.h` are the decoders as they stand in [ubersdr-ntp](https://github.com/madpsy/ubersdr-ntp) (`src/clock/`), which is where they are now maintained — it runs them continuously against several receivers and several frequencies at once, and serves the result as NTP, so timing errors there are visible in a way they are not here.
 
-They began as a verbatim copy of AetherSDR's AetherClock DSP (`src/core/`, commit `b9f44f3`), and were byte-identical for as long as that held. It no longer does. ubersdr-ntp's measurements found and fixed, in these files:
+`Dcf77Decoder` and `tools/dcf77test.cpp` were written in ubersdr-ntp and have no AetherSDR ancestor; the copy here differs only in namespace.
+
+The others began as a verbatim copy of AetherSDR's AetherClock DSP (`src/core/`, commit `b9f44f3`), and were byte-identical for as long as that held. It no longer does. ubersdr-ntp's measurements found and fixed, in these files:
 
 - **Sub-sample edge timing.** WWV's reported edge followed the raw per-second matched-filter shift, which is 5 ms-quantised and moves ±15 ms under noise; it now follows a smoothed sub-sample estimate of the same shift. WWVB's edge had a dead zone and no correction for its own low-pass group delay, which is now computed from the filter coefficients and subtracted analytically.
 - **The WWV/WWVH station tag**, now taken from tick energy above background. The old test mislabelled a WWV receiver as WWVH — which matters, because the two transmitters are 5500 km apart.
@@ -328,7 +348,7 @@ So an upstream fix is no longer a straight `cp` in either direction — diff fir
 
 `src/main.cpp` is written for this repo. It replaces AetherSDR's `AetherClockEngine` (which is Qt, and also owns FlexRadio DAX channel lifecycle) with a stdio front end, keeping only what the engine did on the receive path: hold the sample↔host anchor, arm the voter's plausibility gate against the host clock, and compose the UTC timestamp from the voted frame's second 0 plus elapsed samples.
 
-Format facts throughout are per NIST SP 432 (WWV/WWVH) and NIST SP 250-67 (WWVB).
+Format facts throughout are per NIST SP 432 (WWV/WWVH), NIST SP 250-67 (WWVB), and PTB's DCF77 time-code and phase-modulation pages (DCF77).
 
 ## Licence
 

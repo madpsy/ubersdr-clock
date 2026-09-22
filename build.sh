@@ -16,7 +16,9 @@
 # Building is the easy half. A binary that links and runs can still fail to
 # decode anything, so unless told otherwise this feeds each one a synthetic
 # WWV minute set from tools/wwvgen.py and checks it reaches a lock with the
-# time it was given.
+# time it was given, then the bundled DCF77 recording
+# (tools/testdata/dcf77_live.wav, I/Q) and checks it reads the minute the
+# recording shows.
 #
 # Usage:
 #   ./build.sh [options]
@@ -216,7 +218,34 @@ if [ "$check" = 1 ]; then
     fi
     quality=$(printf %s "$got" | sed -n 's/.*"quality":\([0-9]*\).*/\1/p')
     utc=$(printf %s "$got" | sed -n 's/.*"utc":"\([^"]*\)".*/\1/p')
-    echo "CHECK_OK $utc quality=$quality"
+    echo "CHECK_OK WWV $utc quality=$quality"
+
+    # DCF77: a different decoder on a different input (interleaved I/Q), so
+    # the WWV check above says nothing about it. Five minutes of real signal,
+    # recorded 2026-05-24 around 09:20 UTC. The 44-byte WAV header is dropped,
+    # and the plausibility gate is disarmed because the recording is not now.
+    wav=/src/tools/testdata/dcf77_live.wav
+    if [ ! -f "$wav" ]; then
+        echo "no DCF77 recording at $wav to check against" >&2
+        exit 1
+    fi
+    tail -c +45 "$wav" \
+        | "$binary" --station dcf77 --no-seconds --diag-seconds 0 --plausibility-minutes 0 \
+        > /tmp/dcf77.jsonl
+    if ! grep -q '"state":"locked"' /tmp/dcf77.jsonl; then
+        echo "built, but never locked on the DCF77 recording" >&2
+        tail -3 /tmp/dcf77.jsonl >&2
+        exit 1
+    fi
+    if ! grep -q '"type":"frame","minute":20,"hour":9,"doy":144,"year2":26' /tmp/dcf77.jsonl; then
+        echo "DCF77: locked, but did not read 2026-05-24 09:20 UTC from the recording" >&2
+        grep '"type":"frame"' /tmp/dcf77.jsonl >&2 || true
+        exit 1
+    fi
+    got=$(grep '"type":"time"' /tmp/dcf77.jsonl | tail -1)
+    quality=$(printf %s "$got" | sed -n 's/.*"quality":\([0-9]*\).*/\1/p')
+    utc=$(printf %s "$got" | sed -n 's/.*"utc":"\([^"]*\)".*/\1/p')
+    echo "CHECK_OK DCF77 $utc quality=$quality"
 fi
 
 # The container runs as root; without this the build tree and the binary come

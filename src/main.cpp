@@ -1,7 +1,8 @@
-// ubersdr-clock — standalone WWV/WWVH/WWVB time-code decoder.
+// ubersdr-clock — standalone WWV/WWVH/WWVB/DCF77 time-code decoder.
 //
-// Reads raw mono int16 little-endian PCM on stdin, writes newline-delimited
-// JSON events on stdout. Same shape as UberSDR's other external decoder
+// Reads raw int16 little-endian PCM on stdin — mono audio for WWV/WWVH/WWVB,
+// interleaved I/Q for DCF77 — and writes newline-delimited JSON events on
+// stdout. Same shape as UberSDR's other external decoder
 // binaries (cw-decoder, ubersdr-drm, freedv-ka9q): no framing, no handshake,
 // close stdin to stop.
 //
@@ -29,6 +30,7 @@
 
 #include "WwvDecoder.h"
 #include "WwvbDecoder.h"
+#include "Dcf77Decoder.h"
 
 #include <algorithm>
 #include <cctype>
@@ -38,13 +40,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace {
 
-constexpr const char* kVersion = "1.1.0";
+constexpr const char* kVersion = "1.2.0";
 
 // ---------------------------------------------------------------------------
 // Calendar arithmetic (Howard Hinnant's civil-date algorithms).
@@ -227,6 +230,7 @@ const char* stationName(clockdec::ClockStation s) {
         case ClockStation::Wwv:  return "wwv";
         case ClockStation::Wwvh: return "wwvh";
         case ClockStation::Wwvb: return "wwvb";
+        case ClockStation::Dcf77: return "dcf77";
         default:                 return "unknown";
     }
 }
@@ -258,8 +262,9 @@ const char* refusalName(std::uint8_t r) {
 //
 // Measured, not estimated: tools/decodertest synthesises WWV and WWVH and
 // reports this mean over every edge it checks -- -13.642 and -13.635 ms, spread
-// about +/-1 ms. The WWVB decoder's edges are exact to 0.02 ms, so it has no
-// such term.
+// about +/-1 ms. The WWVB decoder's edges are exact to 0.02 ms, and DCF77's
+// are exact to tools/dcf77test's resolution whichever of AM and PM is timing
+// them, so neither has such a term.
 //
 // Corrected here rather than in the decoder. kNominalDelaySamples was
 // calibrated upstream against real off-air audio through a real receive chain,
@@ -269,6 +274,14 @@ const char* refusalName(std::uint8_t r) {
 // instead. ubersdr-ntp carries the identical term for the identical reason.
 constexpr double kWwvDecoderEdgeBiasMs = -13.645;
 
+// Which decoder runs. WWV and WWVH are one decoder, which tags the station
+// itself; the other two are different signals altogether.
+enum class Decoder { Wwv, Wwvb, Dcf77 };
+
+// The carrier's frequency, for turning a dial frequency into where the carrier
+// sits in the baseband.
+constexpr double kDcf77CarrierHz = 77500.0;
+
 struct Options {
     int sampleRate = 12000;
     // One-way delay this process cannot see, in milliseconds, added back to
@@ -276,7 +289,11 @@ struct Options {
     // README: for a receiver this is dominated by the ionospheric path from
     // the transmitter, which nothing here can compute.
     double extraDelayMs = 0.0;
-    bool wwvb = false;
+    Decoder decoder = Decoder::Wwv;
+    // DCF77 only: where the carrier sits in the complex baseband, in Hz. 0 when
+    // the dial is 77.5 kHz itself. The decoder searches +/-20 Hz around this
+    // and follows the carrier after, so a dial a few Hz out costs nothing.
+    double carrierOffsetHz = 0.0;
     bool seconds = true;
     bool envelope = false;
     int diagSeconds = 10;
@@ -336,10 +353,16 @@ public:
 
         Json j;
         j.str("type", "frame")
-         .i("minute", f.minute).i("hour", f.hour).i("doy", f.doy).i("year2", f.year2)
-         .i("dut1_tenths", f.dut1Tenths)
-         .b("dst1", f.dst1).b("dst2", f.dst2)
-         .b("leap_pending", f.leapPending).b("leap_year", f.leapYear)
+         .i("minute", f.minute).i("hour", f.hour).i("doy", f.doy).i("year2", f.year2);
+        if (m_o.decoder == Decoder::Dcf77) {
+            // DCF77 sends no DUT1, and a 0 here would read as "UT1 is in step
+            // with UTC" rather than "not sent". Its one zone bit is CEST, which
+            // the decoder carries in both DST fields; named for what it is.
+            j.b("dst1", f.dst1).b("dst2", f.dst2).b("cest", f.dst1);
+        } else {
+            j.i("dut1_tenths", f.dut1Tenths).b("dst1", f.dst1).b("dst2", f.dst2);
+        }
+        j.b("leap_pending", f.leapPending).b("leap_year", f.leapYear)
          .f("confidence", f.frameConfidence)
          .i("frame_start_sample", f.frameStartSample)
          .str("station", stationName(f.station));
@@ -376,7 +399,7 @@ public:
         // What remains uncorrected is everything between the antenna and this
         // process's stdin: receiver buffering, the codec, the transport. A
         // caller that knows those should fold them into --extra-delay-ms.
-        const double edgeBias = m_o.wwvb ? 0.0 : kWwvDecoderEdgeBiasMs;
+        const double edgeBias = m_o.decoder == Decoder::Wwv ? kWwvDecoderEdgeBiasMs : 0.0;
         const double offsetMs = static_cast<double>(decodedMs)
                                 - hostMsAtSample(t.lastEdgeSample)
                                 + edgeBias + m_o.extraDelayMs;
@@ -426,6 +449,22 @@ public:
          .f("vote_quality", g.voteQuality, 3)
          .str("refusal", refusalName(g.refusalReason))
          .i("samples_consumed", samples);
+        if (m_o.decoder == Decoder::Dcf77) {
+            // The two demodulators. PM is a 793 ms spread-spectrum correlation
+            // that times the second to tens of microseconds and holds through
+            // noise that buries the AM; AM is how the minute is marked. Which
+            // one is timing the edges, and whether they agree, is the part of a
+            // DCF77 lock worth seeing.
+            static const char* kFrom[] = {"none", "am", "pm", "both", "disagree"};
+            j.b("pm_locked", g.pmLocked)
+             .f("pm_snr_db", g.pmSnrDb, 2)
+             .str("timing_from", g.timingFromPm ? "pm" : "am")
+             .f("am_minus_pm_ms", g.amMinusPmMs, 3)
+             .f("carrier_offset_hz", g.carrierOffsetHz, 3)
+             .str("last_frame_from", kFrom[std::min<int>(g.lastFrameFrom, 4)])
+             .i("pm_refused_locks", g.pmRefusedLocks)
+             .b("pm_interference", g.pmInterference);
+        }
         j.emit();
     }
 
@@ -446,9 +485,16 @@ void emitError(std::string_view message) {
 
 // ---------------------------------------------------------------------------
 
-template <typename Decoder>
+// The decoders' constructors differ only in DCF77 taking the carrier offset.
+template <typename D> D* makeDecoder(const Options& o) { return new D(o.sampleRate); }
+template <> clockdec::Dcf77Decoder* makeDecoder<clockdec::Dcf77Decoder>(const Options& o) {
+    return new clockdec::Dcf77Decoder(o.sampleRate, o.carrierOffsetHz);
+}
+
+template <typename D>
 int run(const Options& o) {
-    Decoder decoder(o.sampleRate);
+    std::unique_ptr<D> owned(makeDecoder<D>(o));
+    D& decoder = *owned;
     Emitter em(o, o.sampleRate);
 
     decoder.onStateChanged = [&](clockdec::ClockLockState s) { em.onState(s, decoder.station()); };
@@ -459,20 +505,27 @@ int run(const Options& o) {
     if (o.plausibilityMinutes > 0)
         decoder.setPlausibility(hostNowFields, o.plausibilityMinutes);
 
-    constexpr std::size_t kChunkSamples = 4096;
-    std::vector<unsigned char> raw(kChunkSamples * 2);
-    std::vector<float> mono(kChunkSamples);
+    // A frame is one sample of every channel: one int16 of mono audio, or an
+    // I and a Q. Sample indices everywhere (edge_sample and the rest) count
+    // frames, so they mean the same instant whichever the input is.
+    const std::size_t channels = o.decoder == Decoder::Dcf77 ? 2 : 1;
+    const std::size_t frameBytes = 2 * channels;
+
+    constexpr std::size_t kChunkFrames = 4096;
+    std::vector<unsigned char> raw(kChunkFrames * frameBytes);
+    std::vector<float> samples(kChunkFrames * channels);
 
     bool anchored = false;
-    unsigned char oddByte = 0;
-    bool haveOddByte = false;
+    // Bytes of a frame split across two reads, carried to the next one. A pipe
+    // makes no promise to deliver whole frames, and dropping the tail would
+    // swap I and Q for the rest of the stream.
+    std::size_t carry = 0;
     const std::int64_t diagEvery =
         o.diagSeconds > 0 ? static_cast<std::int64_t>(o.diagSeconds) * o.sampleRate : 0;
     std::int64_t nextDiag = diagEvery;
 
     for (;;) {
-        std::size_t offset = 0;
-        if (haveOddByte) { raw[0] = oddByte; offset = 1; haveOddByte = false; }
+        const std::size_t offset = carry;
 
         const std::size_t got = std::fread(raw.data() + offset, 1, raw.size() - offset, stdin);
         if (got == 0) {
@@ -492,18 +545,21 @@ int run(const Options& o) {
             anchored = true;
         }
 
-        std::size_t avail = offset + got;
-        const std::size_t nSamples = avail / 2;
-        if (avail & 1u) { oddByte = raw[avail - 1]; haveOddByte = true; }
+        const std::size_t avail = offset + got;
+        const std::size_t nFrames = avail / frameBytes;
+        const std::size_t nValues = nFrames * channels;
 
-        for (std::size_t n = 0; n < nSamples; ++n) {
+        for (std::size_t n = 0; n < nValues; ++n) {
             const auto lo = static_cast<std::uint16_t>(raw[2 * n]);
             const auto hi = static_cast<std::uint16_t>(raw[2 * n + 1]);
             const auto v = static_cast<std::int16_t>(static_cast<std::uint16_t>(lo | (hi << 8)));
-            mono[n] = static_cast<float>(v) * (1.0f / 32768.0f);
+            samples[n] = static_cast<float>(v) * (1.0f / 32768.0f);
         }
 
-        decoder.process(mono.data(), nSamples);
+        carry = avail - nFrames * frameBytes;
+        if (carry) std::memmove(raw.data(), raw.data() + nFrames * frameBytes, carry);
+
+        decoder.process(samples.data(), nFrames);
 
         if (diagEvery > 0 && decoder.samplesConsumed() >= nextDiag) {
             em.onDiag(decoder.diagnostics(), decoder.state(), decoder.station(),
@@ -519,14 +575,17 @@ int run(const Options& o) {
 
 void usage() {
     std::printf(
-        "ubersdr-clock %s — WWV/WWVH/WWVB time-code decoder\n"
+        "ubersdr-clock %s — WWV/WWVH/WWVB/DCF77 time-code decoder\n"
         "\n"
-        "Reads raw mono int16 little-endian PCM on stdin, writes newline-delimited\n"
-        "JSON events on stdout. Close stdin to stop.\n"
+        "Reads raw int16 little-endian PCM on stdin -- mono for WWV/WWVH/WWVB,\n"
+        "interleaved I/Q for DCF77 -- and writes newline-delimited JSON events on\n"
+        "stdout. Close stdin to stop.\n"
         "\n"
         "Options:\n"
         "  --sample-rate HZ           Input PCM rate (default: 12000)\n"
-        "  --station NAME             wwv, wwvh or wwvb (default: wwv)\n"
+        "  --station NAME             wwv, wwvh, wwvb or dcf77 (default: wwv)\n"
+        "  --carrier-offset-hz HZ     DCF77 only: where the carrier sits in the\n"
+        "                             baseband, i.e. 77500 minus the dial (default: 0)\n"
         "  --no-seconds               Suppress the per-second classification events\n"
         "  --envelope                 Include the 1 s alignment arrays in second events\n"
         "  --diag-seconds N           Diagnostics event every N seconds, 0 = off (default: 10)\n"
@@ -543,6 +602,9 @@ void usage() {
         "Tuning:\n"
         "  WWV/WWVH  USB at (carrier - 1 kHz), e.g. 9.999 MHz for the 10 MHz outlet.\n"
         "  WWVB      USB at 0.059 MHz.\n"
+        "  DCF77     IQ at 0.0775 MHz: the carrier at 0 Hz of the baseband. The\n"
+        "            decoder uses its phase as well as its amplitude, which USB\n"
+        "            audio does not carry.\n"
         "  The passband must reach 2.2 kHz: the WWV/WWVH second tick is recovered\n"
         "  from its 2000 Hz (WWV) / 2200 Hz (WWVH) image, and without it the\n"
         "  decoder never gets a second edge to classify against.\n",
@@ -608,16 +670,31 @@ int main(int argc, char** argv) {
             }
             const std::string_view s = next;
             if (s == "wwvb") {
-                o.wwvb = true;
+                o.decoder = Decoder::Wwvb;
+            } else if (s == "dcf77") {
+                o.decoder = Decoder::Dcf77;
             } else if (s == "wwv" || s == "wwvh") {
                 // One decoder covers both: it tags the station itself from
                 // which tick band folds to an impulse.
-                o.wwvb = false;
+                o.decoder = Decoder::Wwv;
             } else {
                 std::fprintf(stderr, "ubersdr-clock: unknown station: %s "
-                                     "(expected wwv, wwvh or wwvb)\n", next);
+                                     "(expected wwv, wwvh, wwvb or dcf77)\n", next);
                 return 2;
             }
+            ++i;
+        } else if (a == "--carrier-offset-hz") {
+            if (next == nullptr) {
+                std::fprintf(stderr, "ubersdr-clock: --carrier-offset-hz requires a value\n");
+                return 2;
+            }
+            char* end = nullptr;
+            const double v = std::strtod(next, &end);
+            if (end == next || *end != '\0' || !std::isfinite(v)) {
+                std::fprintf(stderr, "ubersdr-clock: --carrier-offset-hz: not a number: %s\n", next);
+                return 2;
+            }
+            o.carrierOffsetHz = v;
             ++i;
         } else if (a == "--no-seconds") {
             o.seconds = false;
@@ -642,21 +719,36 @@ int main(int argc, char** argv) {
 
     // The WWV chain needs the 2000/2200 Hz tick images, so Nyquist has to clear
     // 2.2 kHz with room for the tick bandpass skirts; WWVB only needs its
-    // ~1 kHz tone. Both decimate to a fixed series rate (200 Hz / 100 Hz), so
-    // a rate that is not a multiple of it decimates unevenly and drifts.
-    const int seriesRate = o.wwvb ? 100 : 200;
-    if (o.sampleRate < (o.wwvb ? 4000 : 8000)) {
+    // ~1 kHz tone, and DCF77's carrier sits near 0 Hz of a complex baseband.
+    // All decimate to a fixed series rate (200 Hz for WWV/WWVH, 100 Hz for the
+    // other two), so a rate that is not a multiple of it decimates unevenly and
+    // drifts.
+    const char* name = o.decoder == Decoder::Wwv ? "WWV/WWVH"
+                     : o.decoder == Decoder::Wwvb ? "WWVB" : "DCF77";
+    const int seriesRate = o.decoder == Decoder::Wwv ? 200 : 100;
+    const int minRate = o.decoder == Decoder::Wwv ? 8000 : 4000;
+    if (o.sampleRate < minRate) {
         std::fprintf(stderr, "ubersdr-clock: --sample-rate %d is too low for %s "
-                             "(need at least %d Hz)\n",
-                     o.sampleRate, o.wwvb ? "WWVB" : "WWV/WWVH", o.wwvb ? 4000 : 8000);
+                             "(need at least %d Hz)\n", o.sampleRate, name, minRate);
         return 2;
     }
     if (o.sampleRate % seriesRate != 0) {
         std::fprintf(stderr, "ubersdr-clock: --sample-rate %d is not a multiple of %d Hz "
                              "(the %s series rate); decimation would drift\n",
-                     o.sampleRate, seriesRate, o.wwvb ? "WWVB" : "WWV/WWVH");
+                     o.sampleRate, seriesRate, name);
+        return 2;
+    }
+    // The carrier has to be inside the baseband, with room for the +/-20 Hz
+    // search and the AM filter's skirt either side of it.
+    if (o.decoder == Decoder::Dcf77 && std::fabs(o.carrierOffsetHz) > o.sampleRate / 2.0 - 200.0) {
+        std::fprintf(stderr, "ubersdr-clock: --carrier-offset-hz %.1f puts the carrier outside "
+                             "a %d Hz baseband\n", o.carrierOffsetHz, o.sampleRate);
         return 2;
     }
 
-    return o.wwvb ? run<clockdec::WwvbDecoder>(o) : run<clockdec::WwvDecoder>(o);
+    switch (o.decoder) {
+        case Decoder::Wwvb:  return run<clockdec::WwvbDecoder>(o);
+        case Decoder::Dcf77: return run<clockdec::Dcf77Decoder>(o);
+        default:             return run<clockdec::WwvDecoder>(o);
+    }
 }
