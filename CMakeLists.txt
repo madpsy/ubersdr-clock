@@ -12,6 +12,8 @@ add_executable(ubersdr-clock
     src/WwvDecoder.cpp
     src/WwvbDecoder.cpp
     src/Dcf77Decoder.cpp
+    src/MsfDecoder.cpp
+    src/AllouisDecoder.cpp
     src/TimeFrameVoter.cpp
 )
 
@@ -100,3 +102,29 @@ set_target_properties(ubersdr-clock PROPERTIES
 message(STATUS "Binary will be built as ubersdr-clock_${UBERSDR_ARCH}")
 
 install(TARGETS ubersdr-clock DESTINATION /opt/ubersdr-clock)
+
+# MSF's and Allouis's own tests, as ubersdr-ntp has them: synthesised signals
+# (noise, sample-grid offsets, carrier offset, the summer-time change, a leap
+# second for MSF, a maintenance outage for Allouis), then a recording from
+# M9PSY-1 with radiod's GPS capture stamps beside it (tools/testdata), checked
+# second by second against those stamps. A path on the command line replaces
+# the recording.
+add_executable(ubersdr-clock-msftest
+    tools/msftest.cpp
+    src/MsfDecoder.cpp
+    src/TimeFrameVoter.cpp
+)
+target_include_directories(ubersdr-clock-msftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(ubersdr-clock-msftest PRIVATE -Wall -Wextra)
+target_compile_definitions(ubersdr-clock-msftest PRIVATE
+    MSF_TESTDATA="${CMAKE_CURRENT_SOURCE_DIR}/tools/testdata/msf_m9psy1_20260925T0120Z.wav")
+
+add_executable(ubersdr-clock-allouistest
+    tools/allouistest.cpp
+    src/AllouisDecoder.cpp
+    src/TimeFrameVoter.cpp
+)
+target_include_directories(ubersdr-clock-allouistest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(ubersdr-clock-allouistest PRIVATE -Wall -Wextra)
+target_compile_definitions(ubersdr-clock-allouistest PRIVATE
+    ALS162_TESTDATA="${CMAKE_CURRENT_SOURCE_DIR}/tools/testdata/als162_m9psy1_20260925T0120Z.wav")

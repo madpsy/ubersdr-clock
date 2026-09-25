@@ -16,8 +16,8 @@
 # Building is the easy half. A binary that links and runs can still fail to
 # decode anything, so unless told otherwise this feeds each one a synthetic
 # WWV minute set from tools/wwvgen.py and checks it reaches a lock with the
-# time it was given, then the bundled DCF77 recording
-# (tools/testdata/dcf77_live.wav, I/Q) and checks it reads the minute the
+# time it was given, then the bundled DCF77, MSF and Allouis recordings
+# (tools/testdata/*.wav, I/Q) and checks each reads the minute the
 # recording shows.
 #
 # Usage:
@@ -246,6 +246,35 @@ if [ "$check" = 1 ]; then
     quality=$(printf %s "$got" | sed -n 's/.*"quality":\([0-9]*\).*/\1/p')
     utc=$(printf %s "$got" | sed -n 's/.*"utc":"\([^"]*\)".*/\1/p')
     echo "CHECK_OK DCF77 $utc quality=$quality"
+
+    # MSF and Allouis: two more decoders on I/Q, each checked on five minutes
+    # recorded from M9PSY-1 at 01:20 UTC on 2026-09-25 (doy 268). Both must lock
+    # and read the 01:21 UTC frame, the first whole minute in the recording.
+    for st in msf:msf allouis:als162; do
+        name=${st%%:*}; file=${st##*:}
+        wav=/src/tools/testdata/${file}_m9psy1_20260925T0120Z.wav
+        if [ ! -f "$wav" ]; then
+            echo "no $name recording at $wav to check against" >&2
+            exit 1
+        fi
+        tail -c +45 "$wav" \
+            | "$binary" --station "$name" --no-seconds --diag-seconds 0 --plausibility-minutes 0 \
+            > /tmp/$name.jsonl
+        if ! grep -q '"state":"locked"' /tmp/$name.jsonl; then
+            echo "built, but never locked on the $name recording" >&2
+            tail -3 /tmp/$name.jsonl >&2
+            exit 1
+        fi
+        if ! grep -q '"type":"frame","minute":21,"hour":1,"doy":268,"year2":26' /tmp/$name.jsonl; then
+            echo "$name: locked, but did not read 2026-09-25 01:21 UTC from the recording" >&2
+            grep '"type":"frame"' /tmp/$name.jsonl >&2 || true
+            exit 1
+        fi
+        got=$(grep '"type":"time"' /tmp/$name.jsonl | tail -1)
+        quality=$(printf %s "$got" | sed -n 's/.*"quality":\([0-9]*\).*/\1/p')
+        utc=$(printf %s "$got" | sed -n 's/.*"utc":"\([^"]*\)".*/\1/p')
+        echo "CHECK_OK $name $utc quality=$quality"
+    done
 fi
 
 # The container runs as root; without this the build tree and the binary come

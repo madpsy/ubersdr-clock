@@ -1,7 +1,7 @@
-// ubersdr-clock — standalone WWV/WWVH/WWVB/DCF77 time-code decoder.
+// ubersdr-clock — standalone WWV/WWVH/WWVB/DCF77/MSF/Allouis time-code decoder.
 //
 // Reads raw int16 little-endian PCM on stdin — mono audio for WWV/WWVH/WWVB,
-// interleaved I/Q for DCF77 — and writes newline-delimited JSON events on
+// interleaved I/Q for DCF77, MSF and Allouis — and writes newline-delimited JSON events on
 // stdout. Same shape as UberSDR's other external decoder
 // binaries (cw-decoder, ubersdr-drm, freedv-ka9q): no framing, no handshake,
 // close stdin to stop.
@@ -31,6 +31,8 @@
 #include "WwvDecoder.h"
 #include "WwvbDecoder.h"
 #include "Dcf77Decoder.h"
+#include "MsfDecoder.h"
+#include "AllouisDecoder.h"
 
 #include <algorithm>
 #include <cctype>
@@ -47,7 +49,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.2.0";
+constexpr const char* kVersion = "1.3.0";
 
 // ---------------------------------------------------------------------------
 // Calendar arithmetic (Howard Hinnant's civil-date algorithms).
@@ -231,6 +233,8 @@ const char* stationName(clockdec::ClockStation s) {
         case ClockStation::Wwvh: return "wwvh";
         case ClockStation::Wwvb: return "wwvb";
         case ClockStation::Dcf77: return "dcf77";
+        case ClockStation::Msf:   return "msf";
+        case ClockStation::Allouis: return "allouis";
         default:                 return "unknown";
     }
 }
@@ -274,9 +278,23 @@ const char* refusalName(std::uint8_t r) {
 // instead. ubersdr-ntp carries the identical term for the identical reason.
 constexpr double kWwvDecoderEdgeBiasMs = -13.645;
 
+// Where the MSF decoder puts the second against where NPL does: 0.19 ms LATE,
+// so +0.19 ms is added back. The decoder times the steepest point of the
+// carrier's fall; NPL's second is the carrier going off, and the fall (shaped
+// by Anthorn's antenna) takes a fraction of a millisecond to reach its
+// steepest. Measured by ubersdr-ntp on M9PSY-1, capture-timed against a
+// GPS-disciplined stratum 1, 2026-09-25 (night; to be confirmed by day) --
+// its kMsfDecoderEdgeBiasSec. Allouis has none: its decoder reports the
+// second itself, 50.48 ms after the phase excursion starts (measured the same
+// way; AllouisDecoder.cpp).
+constexpr double kMsfDecoderEdgeBiasMs = 0.19;
+
 // Which decoder runs. WWV and WWVH are one decoder, which tags the station
-// itself; the other two are different signals altogether.
-enum class Decoder { Wwv, Wwvb, Dcf77 };
+// itself; the others are different signals altogether.
+enum class Decoder { Wwv, Wwvb, Dcf77, Msf, Allouis };
+
+// The decoders that read complex baseband: each tuned on its carrier, in IQ.
+bool isIq(Decoder d) { return d == Decoder::Dcf77 || d == Decoder::Msf || d == Decoder::Allouis; }
 
 // The carrier's frequency, for turning a dial frequency into where the carrier
 // sits in the baseband.
@@ -290,9 +308,9 @@ struct Options {
     // the transmitter, which nothing here can compute.
     double extraDelayMs = 0.0;
     Decoder decoder = Decoder::Wwv;
-    // DCF77 only: where the carrier sits in the complex baseband, in Hz. 0 when
-    // the dial is 77.5 kHz itself. The decoder searches +/-20 Hz around this
-    // and follows the carrier after, so a dial a few Hz out costs nothing.
+    // IQ stations (DCF77, MSF, Allouis) only: where the carrier sits in the
+    // complex baseband, in Hz. 0 when the dial is the carrier itself. The
+    // decoder searches +/-20 Hz around this, so a dial a few Hz out costs nothing.
     double carrierOffsetHz = 0.0;
     bool seconds = true;
     bool envelope = false;
@@ -324,6 +342,10 @@ public:
         Json j;
         j.str("type", "second")
          .i("edge_sample", i.edgeSample)
+         // The same edge before it was rounded to a whole sample, where the
+         // decoder resolves it finer (DCF77, MSF, Allouis); null where it does
+         // not. A whole sample is 83 us at 12 kHz.
+         .f("edge_sample_exact", i.edgeSampleExact, 3)
          .i("symbol", static_cast<long long>(i.symbol))
          .f("confidence", i.confidence)
          .i("second_of_frame", i.secondOfFrame)
@@ -354,11 +376,15 @@ public:
         Json j;
         j.str("type", "frame")
          .i("minute", f.minute).i("hour", f.hour).i("doy", f.doy).i("year2", f.year2);
-        if (m_o.decoder == Decoder::Dcf77) {
-            // DCF77 sends no DUT1, and a 0 here would read as "UT1 is in step
-            // with UTC" rather than "not sent". Its one zone bit is CEST, which
-            // the decoder carries in both DST fields; named for what it is.
+        if (m_o.decoder == Decoder::Dcf77 || m_o.decoder == Decoder::Allouis) {
+            // DCF77 and Allouis send no DUT1, and a 0 here would read as "UT1
+            // is in step with UTC" rather than "not sent". Their one zone bit
+            // is CEST, which the decoder carries in both DST fields; named for
+            // what it is.
             j.b("dst1", f.dst1).b("dst2", f.dst2).b("cest", f.dst1);
+        } else if (m_o.decoder == Decoder::Msf) {
+            // MSF sends DUT1, and UK clock time: its zone bit is BST.
+            j.i("dut1_tenths", f.dut1Tenths).b("dst1", f.dst1).b("dst2", f.dst2).b("bst", f.dst1);
         } else {
             j.i("dut1_tenths", f.dut1Tenths).b("dst1", f.dst1).b("dst2", f.dst2);
         }
@@ -399,7 +425,8 @@ public:
         // What remains uncorrected is everything between the antenna and this
         // process's stdin: receiver buffering, the codec, the transport. A
         // caller that knows those should fold them into --extra-delay-ms.
-        const double edgeBias = m_o.decoder == Decoder::Wwv ? kWwvDecoderEdgeBiasMs : 0.0;
+        const double edgeBias = m_o.decoder == Decoder::Wwv ? kWwvDecoderEdgeBiasMs
+                              : m_o.decoder == Decoder::Msf ? kMsfDecoderEdgeBiasMs : 0.0;
         const double offsetMs = static_cast<double>(decodedMs)
                                 - hostMsAtSample(t.lastEdgeSample)
                                 + edgeBias + m_o.extraDelayMs;
@@ -420,6 +447,10 @@ public:
          // there is one place the figure lives.
          .f("delay_applied_ms", edgeBias + m_o.extraDelayMs, 3)
          .i("last_edge_sample", t.lastEdgeSample)
+         // Unrounded, where the decoder resolves it (see edge_sample_exact). A
+         // caller re-timing the offset against better timestamps should use
+         // this when it is not null.
+         .f("last_edge_sample_exact", t.lastEdgeSampleExact, 3)
          .i("frame_start_sample", m_frameStartSample)
          .i("host_anchor_ms", m_anchorMs)
          .str("station", stationName(t.station));
@@ -464,6 +495,15 @@ public:
              .str("last_frame_from", kFrom[std::min<int>(g.lastFrameFrom, 4)])
              .i("pm_refused_locks", g.pmRefusedLocks)
              .b("pm_interference", g.pmInterference);
+        } else if (m_o.decoder == Decoder::Allouis) {
+            // Allouis is timed by correlating each second's whole phase
+            // modulation: whether that correlation is tracking, and how clear.
+            j.b("timing_locked", g.pmLocked)
+             .f("timing_snr_db", g.pmSnrDb, 2)
+             .b("timing", g.timingFromPm)
+             .f("carrier_offset_hz", g.carrierOffsetHz, 3);
+        } else if (m_o.decoder == Decoder::Msf) {
+            j.f("carrier_offset_hz", g.carrierOffsetHz, 3);
         }
         j.emit();
     }
@@ -485,10 +525,16 @@ void emitError(std::string_view message) {
 
 // ---------------------------------------------------------------------------
 
-// The decoders' constructors differ only in DCF77 taking the carrier offset.
+// The decoders' constructors differ only in the IQ ones taking the carrier offset.
 template <typename D> D* makeDecoder(const Options& o) { return new D(o.sampleRate); }
 template <> clockdec::Dcf77Decoder* makeDecoder<clockdec::Dcf77Decoder>(const Options& o) {
     return new clockdec::Dcf77Decoder(o.sampleRate, o.carrierOffsetHz);
+}
+template <> clockdec::MsfDecoder* makeDecoder<clockdec::MsfDecoder>(const Options& o) {
+    return new clockdec::MsfDecoder(o.sampleRate, o.carrierOffsetHz);
+}
+template <> clockdec::AllouisDecoder* makeDecoder<clockdec::AllouisDecoder>(const Options& o) {
+    return new clockdec::AllouisDecoder(o.sampleRate, o.carrierOffsetHz);
 }
 
 template <typename D>
@@ -508,7 +554,7 @@ int run(const Options& o) {
     // A frame is one sample of every channel: one int16 of mono audio, or an
     // I and a Q. Sample indices everywhere (edge_sample and the rest) count
     // frames, so they mean the same instant whichever the input is.
-    const std::size_t channels = o.decoder == Decoder::Dcf77 ? 2 : 1;
+    const std::size_t channels = isIq(o.decoder) ? 2 : 1;
     const std::size_t frameBytes = 2 * channels;
 
     constexpr std::size_t kChunkFrames = 4096;
@@ -575,17 +621,17 @@ int run(const Options& o) {
 
 void usage() {
     std::printf(
-        "ubersdr-clock %s — WWV/WWVH/WWVB/DCF77 time-code decoder\n"
+        "ubersdr-clock %s — WWV/WWVH/WWVB/DCF77/MSF/Allouis time-code decoder\n"
         "\n"
         "Reads raw int16 little-endian PCM on stdin -- mono for WWV/WWVH/WWVB,\n"
-        "interleaved I/Q for DCF77 -- and writes newline-delimited JSON events on\n"
-        "stdout. Close stdin to stop.\n"
+        "interleaved I/Q for DCF77, MSF and Allouis -- and writes newline-delimited\n"
+        "JSON events on stdout. Close stdin to stop.\n"
         "\n"
         "Options:\n"
         "  --sample-rate HZ           Input PCM rate (default: 12000)\n"
-        "  --station NAME             wwv, wwvh, wwvb or dcf77 (default: wwv)\n"
-        "  --carrier-offset-hz HZ     DCF77 only: where the carrier sits in the\n"
-        "                             baseband, i.e. 77500 minus the dial (default: 0)\n"
+        "  --station NAME             wwv, wwvh, wwvb, dcf77, msf or allouis (default: wwv)\n"
+        "  --carrier-offset-hz HZ     DCF77, MSF, Allouis: where the carrier sits in the\n"
+        "                             baseband, i.e. carrier minus the dial (default: 0)\n"
         "  --no-seconds               Suppress the per-second classification events\n"
         "  --envelope                 Include the 1 s alignment arrays in second events\n"
         "  --diag-seconds N           Diagnostics event every N seconds, 0 = off (default: 10)\n"
@@ -605,6 +651,8 @@ void usage() {
         "  DCF77     IQ at 0.0775 MHz: the carrier at 0 Hz of the baseband. The\n"
         "            decoder uses its phase as well as its amplitude, which USB\n"
         "            audio does not carry.\n"
+        "  MSF       IQ at 0.060 MHz: timed on the carrier's own coherent amplitude.\n"
+        "  Allouis   IQ at 0.162 MHz: phase modulation only.\n"
         "  The passband must reach 2.2 kHz: the WWV/WWVH second tick is recovered\n"
         "  from its 2000 Hz (WWV) / 2200 Hz (WWVH) image, and without it the\n"
         "  decoder never gets a second edge to classify against.\n",
@@ -673,13 +721,17 @@ int main(int argc, char** argv) {
                 o.decoder = Decoder::Wwvb;
             } else if (s == "dcf77") {
                 o.decoder = Decoder::Dcf77;
+            } else if (s == "msf") {
+                o.decoder = Decoder::Msf;
+            } else if (s == "allouis") {
+                o.decoder = Decoder::Allouis;
             } else if (s == "wwv" || s == "wwvh") {
                 // One decoder covers both: it tags the station itself from
                 // which tick band folds to an impulse.
                 o.decoder = Decoder::Wwv;
             } else {
                 std::fprintf(stderr, "ubersdr-clock: unknown station: %s "
-                                     "(expected wwv, wwvh, wwvb or dcf77)\n", next);
+                                     "(expected wwv, wwvh, wwvb, dcf77, msf or allouis)\n", next);
                 return 2;
             }
             ++i;
@@ -723,9 +775,13 @@ int main(int argc, char** argv) {
     // All decimate to a fixed series rate (200 Hz for WWV/WWVH, 100 Hz for the
     // other two), so a rate that is not a multiple of it decimates unevenly and
     // drifts.
+    // Allouis folds its phase at 1 kHz to find the second, so its rate must
+    // divide into that evenly too.
     const char* name = o.decoder == Decoder::Wwv ? "WWV/WWVH"
-                     : o.decoder == Decoder::Wwvb ? "WWVB" : "DCF77";
-    const int seriesRate = o.decoder == Decoder::Wwv ? 200 : 100;
+                     : o.decoder == Decoder::Wwvb ? "WWVB"
+                     : o.decoder == Decoder::Msf ? "MSF"
+                     : o.decoder == Decoder::Allouis ? "Allouis" : "DCF77";
+    const int seriesRate = o.decoder == Decoder::Wwv ? 200 : o.decoder == Decoder::Allouis ? 1000 : 100;
     const int minRate = o.decoder == Decoder::Wwv ? 8000 : 4000;
     if (o.sampleRate < minRate) {
         std::fprintf(stderr, "ubersdr-clock: --sample-rate %d is too low for %s "
@@ -740,7 +796,7 @@ int main(int argc, char** argv) {
     }
     // The carrier has to be inside the baseband, with room for the +/-20 Hz
     // search and the AM filter's skirt either side of it.
-    if (o.decoder == Decoder::Dcf77 && std::fabs(o.carrierOffsetHz) > o.sampleRate / 2.0 - 200.0) {
+    if (isIq(o.decoder) && std::fabs(o.carrierOffsetHz) > o.sampleRate / 2.0 - 200.0) {
         std::fprintf(stderr, "ubersdr-clock: --carrier-offset-hz %.1f puts the carrier outside "
                              "a %d Hz baseband\n", o.carrierOffsetHz, o.sampleRate);
         return 2;
@@ -749,6 +805,8 @@ int main(int argc, char** argv) {
     switch (o.decoder) {
         case Decoder::Wwvb:  return run<clockdec::WwvbDecoder>(o);
         case Decoder::Dcf77: return run<clockdec::Dcf77Decoder>(o);
+        case Decoder::Msf:   return run<clockdec::MsfDecoder>(o);
+        case Decoder::Allouis: return run<clockdec::AllouisDecoder>(o);
         default:             return run<clockdec::WwvDecoder>(o);
     }
 }

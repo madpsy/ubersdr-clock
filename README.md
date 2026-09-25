@@ -1,8 +1,8 @@
 # ubersdr-clock
 
-Standalone WWV / WWVH / WWVB / DCF77 time-code decoder. Reads raw PCM (audio, or I/Q for DCF77) from stdin, writes decoded time as JSON to stdout. No dependencies beyond a C++20 compiler — no Qt, no FFTW, no system libraries beyond libstdc++.
+Standalone WWV / WWVH / WWVB / DCF77 / MSF / Allouis time-code decoder. Reads raw PCM (audio, or I/Q for DCF77, MSF and Allouis) from stdin, writes decoded time as JSON to stdout. No dependencies beyond a C++20 compiler — no Qt, no FFTW, no system libraries beyond libstdc++.
 
-Built for UberSDR as an external decoder binary, in the same shape as `cw-decoder`, `ubersdr-drm` and `freedv-ka9q`: the Go audio extension spawns it, pipes the session's demodulated audio (or, for DCF77, its IQ) into stdin, and reads events from stdout. It runs fine on its own from a WAV file too.
+Built for UberSDR as an external decoder binary, in the same shape as `cw-decoder`, `ubersdr-drm` and `freedv-ka9q`: the Go audio extension spawns it, pipes the session's demodulated audio (or, for DCF77, MSF and Allouis, its IQ) into stdin, and reads events from stdout. It runs fine on its own from a WAV file too.
 
 The DSP is AetherSDR's AetherClock chain, as corrected by [ubersdr-ntp](https://github.com/madpsy/ubersdr-ntp) — see [Provenance](#provenance).
 
@@ -91,12 +91,14 @@ This matters more than anything else here. The decoder is written against a spec
 | **WWV / WWVH** | **USB at (carrier − 1 kHz)** — 4.999, 9.999, 14.999, 19.999 MHz | Puts the RF carrier at 1000 Hz audio, the 100 Hz BCD subcarrier sidebands at 900/1100 Hz, and the seconds tick at its 2000 Hz (WWV) / 2200 Hz (WWVH) image |
 | **WWVB** | **USB at 0.059 MHz** | Puts the 60 kHz carrier at ~1000 Hz audio, where the PWM rides on its amplitude |
 | **DCF77** | **IQ at 0.0775 MHz** | Puts the 77.5 kHz carrier at 0 Hz of the complex baseband. The decoder reads the 512-chip phase code as well as the amplitude cuts, and USB audio carries no phase. A dial off the carrier works if `--carrier-offset-hz` says where it is |
+| **MSF** | **IQ at 0.060 MHz** | NPL's 60 kHz signal from Anthorn, on-off keyed. Taken as IQ so the second's edge is timed on the carrier's own coherent amplitude at full rate, with no audio filter or AGC in the way. (WWVB shares 60 kHz: USB at 0.059 MHz is WWVB, IQ at 0.060 MHz is MSF) |
+| **Allouis** | **IQ at 0.162 MHz** | ALS162 (formerly TDF), France: phase modulation only, so IQ is required. Off air every Tuesday 08:00–12:00 French time |
 
 **The passband must reach 2.2 kHz.** The WWV/WWVH second edge is recovered entirely from the tick image, and the station tag (WWV vs WWVH) is decided by which of the 2000/2200 Hz bands folds to an impulse. A 2.4 kHz SSB filter clips one or both, and the decoder never gets a second edge to classify against — it will sit in `acquiring` forever with `tone_detected: false`. WWVB only needs its ~1 kHz tone.
 
 ## Input
 
-**Signed 16-bit little-endian raw PCM on stdin** at the rate given by `--sample-rate` (default: 12000 Hz): mono for WWV/WWVH/WWVB, **interleaved I then Q** for DCF77.
+**Signed 16-bit little-endian raw PCM on stdin** at the rate given by `--sample-rate` (default: 12000 Hz): mono for WWV/WWVH/WWVB, **interleaved I then Q** for DCF77, MSF and Allouis.
 
 No WAV header — raw samples only. 12 kHz is UberSDR's rate for `usb`/`lsb`/`cwu`/`cwl` and for `iq`; AM/FM sessions are 24 kHz. Sample indices in the output (`edge_sample` and the rest) count frames, so an I/Q pair is one sample.
 
@@ -115,7 +117,7 @@ tail -c +45 tools/testdata/dcf77_live.wav | \
     ./ubersdr-clock_amd64 --station dcf77 --plausibility-minutes 0
 ```
 
-The sample rate must be a multiple of the decoder's internal series rate — 200 Hz for WWV/WWVH, 100 Hz for WWVB and DCF77 — or decimation drifts. 12000 and 24000 both divide cleanly; anything that does not is refused at startup rather than decoded wrongly.
+The sample rate must be a multiple of the decoder's internal series rate — 200 Hz for WWV/WWVH, 100 Hz for WWVB, DCF77 and MSF, 1000 Hz for Allouis (its acquisition folds the phase at 1 kHz) — or decimation drifts. 12000 and 24000 both divide cleanly; anything that does not is refused at startup rather than decoded wrongly.
 
 ## Output
 
@@ -130,7 +132,7 @@ One JSON object per line on stdout, flushed per line. Five event types.
 | Field | Values |
 |---|---|
 | `state` | `nosignal`, `acquiring`, `locked` |
-| `station` | `unknown`, `wwv`, `wwvh`, `wwvb`, `dcf77` |
+| `station` | `unknown`, `wwv`, `wwvh`, `wwvb`, `dcf77`, `msf`, `allouis` |
 
 `station` stays `unknown` until the tick fold separates the two bands confidently; it is never guessed.
 
@@ -166,7 +168,7 @@ The raw difference is the decoded time against the host clock at the sample the 
 
 | Term | Typical | Corrected here? |
 |---|---|---|
-| **Decoder edge bias** | −13.6 ms (WWV/WWVH), 0 (WWVB) | **Yes**, unconditionally — see below |
+| **Decoder edge bias** | −13.6 ms (WWV/WWVH), +0.19 ms (MSF), 0 (WWVB, DCF77, Allouis) | **Yes**, unconditionally — see below |
 | **Ionospheric path** from the transmitter | +5 to +40 ms | **No.** Nothing here knows where it or the transmitter is |
 | Receiver buffering, multicast hop | tens of ms | No — the caller's; not visible from stdin |
 | Codec (Opus) | ~8 ms | No — the caller's |
@@ -244,8 +246,8 @@ Argument errors go to stderr with exit code 2 instead — nothing is decoding ye
 | Option | Description |
 |---|---|
 | `--sample-rate HZ` | Input PCM rate (default: 12000) |
-| `--station NAME` | `wwv`, `wwvh`, `wwvb` or `dcf77` (default: `wwv`) |
-| `--carrier-offset-hz HZ` | DCF77 only: the carrier's place in the baseband, 77500 minus the dial (default: 0) |
+| `--station NAME` | `wwv`, `wwvh`, `wwvb`, `dcf77`, `msf` or `allouis` (default: `wwv`) |
+| `--carrier-offset-hz HZ` | DCF77, MSF, Allouis: the carrier's place in the baseband, the carrier minus the dial (default: 0) |
 | `--no-seconds` | Suppress the per-second events |
 | `--envelope` | Include the 1 s alignment arrays in second events |
 | `--diag-seconds N` | Diagnostics interval, 0 to disable (default: 10) |
@@ -259,6 +261,8 @@ Two of these are not optional for an embedding caller:
 - **`--sample-rate` always.** The default of 12000 matches UberSDR's `usb`/`lsb`/`cwu`/`cwl` sessions, but an AM or FM session is 24000. Passing the wrong one does not fail — it decodes at the wrong speed and never locks.
 - **`--station wwvb` when tuned to WWVB.** WWV/WWVH and WWVB are genuinely different decoders: a 100 Hz BCD subcarrier against PWM on the carrier's own amplitude, LSB-first weights against MSB-first, a marker-hole anchoring search against a double marker. Nothing can be shared, and neither will decode the other's signal. A caller that knows the dial frequency can decide this without asking anyone — within a few kHz of 77.5 kHz is DCF77, otherwise below 1 MHz is WWVB, everything else is WWV/WWVH.
 - **`--station dcf77`, with I/Q input, when tuned to DCF77.** A third decoder again: the carrier cut (AM) and a pseudo-random phase code (PM), both every second, each minute decoded from both and certified only when they do not contradict each other. It reads I/Q rather than audio, so the caller has to deliver an IQ stream, not just pass the flag.
+- **`--station msf`, with I/Q input, when tuned to MSF in IQ at 60 kHz.** On-off keyed, two bits a second, the time code read back from the end of the minute so leap-second minutes decode; UK clock time converted to UTC. Its edge is 0.19 ms after NPL's second, corrected in `offset_ms`.
+- **`--station allouis`, with I/Q input, when tuned to 162 kHz.** Phase modulation only: each second is timed by correlating its whole expected phase (the data excursions and that second's position code), and the position codes name each second. French legal time converted to UTC. Its second is 50.48 ms after the excursion starts, which the decoder reports directly.
 
 Everything else is automatic. In particular **`wwv` and `wwvh` select the same decoder**: it identifies the station itself from which tick band folds to an impulse, and reports it in `station` on every event. Frame sync, symbol timing, sample-clock drift tracking and resynchronisation after a discontinuity need no help either.
 
@@ -271,6 +275,15 @@ This is a safety gate, and turning it off is riskier than it looks. A deep fade 
 The default bound of one day is deliberately generous: a host clock that is hours wrong is exactly what this tool measures, and only a decode *decades* out can be assumed garbage. Disarm it (`0`) for offline corpus work where there is no meaningful reference, not on a live receiver.
 
 ## Testing without a receiver
+
+### MSF and Allouis
+
+`ubersdr-clock-msftest` and `ubersdr-clock-allouistest` synthesise each station as an UberSDR `iq` session delivers it — noise down to the lock limit, sample-grid offsets, carrier offset, inverted I/Q, the summer-time change, a leap-second minute (MSF) and a Tuesday outage (Allouis) — and check every label and edge against the truth. Each then decodes a five-minute recording from M9PSY-1 (`tools/testdata/*_m9psy1_20260925T0120Z.wav`) with radiod's GPS capture stamp for every packet beside it (`.times.csv`), and checks every labelled second against the UTC second those stamps put it in. The decoders and tests are ubersdr-ntp's, where they are maintained.
+
+```bash
+./build/ubersdr-clock-msftest
+./build/ubersdr-clock-allouistest
+```
 
 ### DCF77
 
